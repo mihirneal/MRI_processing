@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import multiprocessing
+import os
 import subprocess
 import sys
 import tempfile
@@ -29,14 +30,19 @@ def setup_logging(log_file: Path) -> None:
     logger.addHandler(sh)
 
 
-def _pool_init(log_file: Path) -> None:
+def _pool_init(log_file: Path, itk_threads: int) -> None:
+    os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = str(itk_threads)
     setup_logging(log_file)
 
 
-def find_t1w_files(bids_dir: Path, subject: str | None = None) -> list[Path]:
-    pattern = "*/anat/*_T1w.nii.gz"
-    files = list(bids_dir.glob(pattern))            # flat: sub-X/anat/
-    files += list(bids_dir.glob("*/*/anat/*_T1w.nii.gz"))  # session: sub-X/ses-Y/anat/
+SUPPORTED_SUFFIXES = ("T1w", "T2w", "FLAIR")
+
+
+def find_anat_files(bids_dir: Path, subject: str | None = None) -> list[Path]:
+    files = []
+    for suffix in SUPPORTED_SUFFIXES:
+        files += list(bids_dir.glob(f"*/anat/*_{suffix}.nii.gz"))
+        files += list(bids_dir.glob(f"*/*/anat/*_{suffix}.nii.gz"))
     if subject:
         files = [f for f in files if f.parts[len(bids_dir.parts)] == subject]
     return sorted(files)
@@ -44,10 +50,11 @@ def find_t1w_files(bids_dir: Path, subject: str | None = None) -> list[Path]:
 
 def output_paths(input_path: Path, bids_dir: Path, out_dir: Path) -> tuple[Path, Path]:
     rel = input_path.relative_to(bids_dir)
-    stem = input_path.name.replace("_T1w.nii.gz", "")
+    suffix = next(s for s in SUPPORTED_SUFFIXES if input_path.name.endswith(f"_{s}.nii.gz"))
+    stem = input_path.name.replace(f"_{suffix}.nii.gz", "")
     anat_dir = out_dir / rel.parent
     anat_dir.mkdir(parents=True, exist_ok=True)
-    preproc = anat_dir / f"{stem}_desc-preproc_T1w.nii.gz"
+    preproc = anat_dir / f"{stem}_desc-preproc_{suffix}.nii.gz"
     mask    = anat_dir / f"{stem}_desc-brain_mask.nii.gz"
     return preproc, mask
 
@@ -195,12 +202,15 @@ def write_dataset_description(out_dir: Path) -> None:
 def main() -> None:
     default_bids = Path(__file__).parent / "data" / "raw"
     default_out  = Path(__file__).parent / "data" / "processed"
+    default_logs = Path(__file__).parent / "data" / "logs"
 
     parser = argparse.ArgumentParser(description="Anat preprocessing pipeline")
-    parser.add_argument("--bids",      default=default_bids, type=Path)
-    parser.add_argument("--subject",   default=None,         type=str)
-    parser.add_argument("--output",    default=default_out,  type=Path)
-    parser.add_argument("--n_workers", default=multiprocessing.cpu_count(), type=int)
+    parser.add_argument("--bids",        default=default_bids, type=Path)
+    parser.add_argument("--subject",     default=None,         type=str)
+    parser.add_argument("--output",      default=default_out,  type=Path)
+    parser.add_argument("--log_dir",     default=default_logs, type=Path)
+    parser.add_argument("--n_workers",   default=48,           type=int)
+    parser.add_argument("--itk_threads", default=2,            type=int)
     args = parser.parse_args()
 
     bids_dir = args.bids.resolve()
@@ -208,21 +218,22 @@ def main() -> None:
 
     write_dataset_description(out_dir)
 
-    log_dir = Path(__file__).parent / "data" / "logs"
+    log_dir = args.log_dir.resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "preprocessing.log"
     setup_logging(log_file)
 
-    files = find_t1w_files(bids_dir, args.subject)
+    files = find_anat_files(bids_dir, args.subject)
     if not files:
-        log.info("No T1w files found.")
+        log.info("No T1w/T2w/FLAIR files found.")
         return
 
-    log.info("Found %d T1w file(s). Workers: %d", len(files), args.n_workers)
+    log.info("Found %d anat file(s). Workers: %d", len(files), args.n_workers)
     tasks = [(f, bids_dir, out_dir) for f in files]
 
     if args.n_workers > 1:
-        with multiprocessing.Pool(args.n_workers, initializer=_pool_init, initargs=(log_file,)) as pool:
+        os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = str(args.itk_threads)
+        with multiprocessing.Pool(args.n_workers, initializer=_pool_init, initargs=(log_file, args.itk_threads)) as pool:
             results = pool.map(process_file, tasks)
     else:
         results = [process_file(task) for task in tasks]
