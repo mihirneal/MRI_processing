@@ -1,0 +1,12 @@
+[project]
+name = "test-bids"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "nibabel",
+    "antspyx",
+    "numpy",
+    "docker>=7.1.0",
+]
