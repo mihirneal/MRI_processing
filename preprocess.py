@@ -147,9 +147,17 @@ def process_file(args: tuple[Path, Path, Path]) -> dict:
         log.info("%s — SynthStrip skull stripping", name)
         brain, mask = synthstrip(img)
 
-        log.info("%s — resampling to 1 mm isotropic", name)
-        brain = resample_1mm(brain)
-        mask  = resample_mask_1mm(mask)
+        zooms = brain.header.get_zooms()[:3]
+        if not np.allclose(zooms, 1.0, atol=1e-3):
+            log.info("%s — resampling to 1 mm isotropic", name)
+            brain = resample_1mm(brain)
+            mask  = resample_mask_1mm(mask)
+        else:
+            log.info("%s — already 1 mm isotropic, skipping resample", name)
+
+        brain_data = brain.get_fdata() * mask.get_fdata()
+        brain_data = np.clip(brain_data, 0, None)
+        brain = nib.Nifti1Image(brain_data, brain.affine, brain.header)
 
         log.info("%s — cropping to brain bounding box", name)
         brain, mask = crop_to_brain(brain, mask)
