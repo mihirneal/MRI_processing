@@ -3,6 +3,7 @@ import json
 import logging
 import multiprocessing
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,27 +37,48 @@ def _pool_init(log_file: Path, itk_threads: int) -> None:
 
 
 SUPPORTED_SUFFIXES = ("T1w", "T2w", "FLAIR")
+TEMPLATE_SPACE = "MNI152NLin2009cAsym"
+DEFAULT_TEMPLATE_DIR = Path("/opt/templateflow") / f"tpl-{TEMPLATE_SPACE}"
+DEFAULT_TEMPLATE_BRAIN = (
+    DEFAULT_TEMPLATE_DIR / f"tpl-{TEMPLATE_SPACE}_res-01_desc-brain_T1w.nii.gz"
+)
+DEFAULT_TEMPLATE_T1W = DEFAULT_TEMPLATE_DIR / f"tpl-{TEMPLATE_SPACE}_res-01_T1w.nii.gz"
+
+
+def is_supported_anat_file(path: Path, bids_dir: Path) -> bool:
+    rel = path.relative_to(bids_dir)
+    if path.parent.name != "anat":
+        return False
+    if not any(part.startswith("sub-") for part in rel.parts):
+        return False
+    return any(path.name.endswith(f"_{suffix}.nii.gz") for suffix in SUPPORTED_SUFFIXES)
 
 
 def find_anat_files(bids_dir: Path, subject: str | None = None) -> list[Path]:
     files = []
-    for suffix in SUPPORTED_SUFFIXES:
-        files += list(bids_dir.glob(f"*/anat/*_{suffix}.nii.gz"))
-        files += list(bids_dir.glob(f"*/*/anat/*_{suffix}.nii.gz"))
+    for root, dirs, names in os.walk(bids_dir, followlinks=True):
+        root_path = Path(root)
+        for name in names:
+            if not name.endswith(".nii.gz"):
+                continue
+            path = root_path / name
+            if is_supported_anat_file(path, bids_dir):
+                files.append(path)
     if subject:
-        files = [f for f in files if f.parts[len(bids_dir.parts)] == subject]
+        files = [path for path in files if subject in path.relative_to(bids_dir).parts]
     return sorted(files)
 
 
-def output_paths(input_path: Path, bids_dir: Path, out_dir: Path) -> tuple[Path, Path]:
+def output_paths(input_path: Path, bids_dir: Path, out_dir: Path) -> tuple[Path, Path, Path]:
     rel = input_path.relative_to(bids_dir)
     suffix = next(s for s in SUPPORTED_SUFFIXES if input_path.name.endswith(f"_{s}.nii.gz"))
     stem = input_path.name.replace(f"_{suffix}.nii.gz", "")
     anat_dir = out_dir / rel.parent
     anat_dir.mkdir(parents=True, exist_ok=True)
-    preproc = anat_dir / f"{stem}_desc-preproc_{suffix}.nii.gz"
-    mask    = anat_dir / f"{stem}_desc-brain_mask.nii.gz"
-    return preproc, mask
+    preproc = anat_dir / f"{stem}_space-{TEMPLATE_SPACE}_desc-preproc_{suffix}.nii.gz"
+    mask = anat_dir / f"{stem}_space-{TEMPLATE_SPACE}_desc-brain_mask_{suffix}.nii.gz"
+    xfm = anat_dir / f"{stem}_from-native_to-{TEMPLATE_SPACE}_mode-image_desc-{suffix}_xfm.mat"
+    return preproc, mask, xfm
 
 
 def reorient_to_ras(img: nib.Nifti1Image) -> nib.Nifti1Image:
@@ -115,29 +137,66 @@ def resample_mask_1mm(mask: nib.Nifti1Image) -> nib.Nifti1Image:
     return ants_to_nib(resampled)
 
 
-def crop_to_brain(img: nib.Nifti1Image, mask: nib.Nifti1Image) -> tuple[nib.Nifti1Image, nib.Nifti1Image]:
-    mask_data = mask.get_fdata()
-    coords = np.argwhere(mask_data > 0.5)
-    if coords.size == 0:
-        raise ValueError("empty brain mask — SynthStrip may have failed")
-    lo, hi = coords.min(0), coords.max(0) + 1
+def rigid_register_to_template(
+    img: nib.Nifti1Image,
+    mask: nib.Nifti1Image,
+    template_brain_path: Path,
+    transform_path: Path,
+) -> tuple[nib.Nifti1Image, nib.Nifti1Image]:
+    fixed = ants.image_read(str(template_brain_path))
+    moving = nib_to_ants(img)
+    moving_mask = nib_to_ants(mask)
 
-    def crop_img(src: nib.Nifti1Image) -> nib.Nifti1Image:
-        data = src.get_fdata()
-        affine = src.affine.copy()
-        cropped = data[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]]
-        affine[:3, 3] = affine[:3, :3] @ lo + affine[:3, 3]
-        return nib.Nifti1Image(cropped, affine, src.header)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        outprefix = str(Path(tmpdir) / "rigid_")
+        tx = ants.registration(
+            fixed=fixed,
+            moving=moving,
+            type_of_transform="Rigid",
+            outprefix=outprefix,
+        )
+        fwdtransforms = tx["fwdtransforms"]
+        rigid_transform = next((Path(path) for path in fwdtransforms if str(path).endswith(".mat")), None)
+        if rigid_transform is None:
+            raise RuntimeError("ANTs rigid registration did not produce a matrix transform")
 
-    return crop_img(img), crop_img(mask)
+        registered = ants.apply_transforms(
+            fixed=fixed,
+            moving=moving,
+            transformlist=fwdtransforms,
+            interpolator="bSpline",
+        )
+        registered_mask = ants.apply_transforms(
+            fixed=fixed,
+            moving=moving_mask,
+            transformlist=fwdtransforms,
+            interpolator="nearestNeighbor",
+        )
+        shutil.copy2(rigid_transform, transform_path)
+
+    return ants_to_nib(registered), ants_to_nib(registered_mask)
 
 
-def process_file(args: tuple[Path, Path, Path]) -> dict:
-    input_path, bids_dir, out_dir = args
+def apply_mask_and_clip(img: nib.Nifti1Image, mask: nib.Nifti1Image) -> tuple[nib.Nifti1Image, nib.Nifti1Image]:
+    mask_data = (mask.get_fdata() > 0.5).astype(np.uint8)
+    brain_data = np.clip(img.get_fdata() * mask_data, 0, None).astype(np.float32)
+
+    brain_header = img.header.copy()
+    brain_header.set_data_dtype(np.float32)
+    mask_header = mask.header.copy()
+    mask_header.set_data_dtype(np.uint8)
+
+    brain = nib.Nifti1Image(brain_data, img.affine, brain_header)
+    bin_mask = nib.Nifti1Image(mask_data, mask.affine, mask_header)
+    return brain, bin_mask
+
+
+def process_file(args: tuple[Path, Path, Path, Path]) -> dict:
+    input_path, bids_dir, out_dir, template_brain_path = args
     name = input_path.name
-    preproc_path, mask_path = output_paths(input_path, bids_dir, out_dir)
+    preproc_path, mask_path, xfm_path = output_paths(input_path, bids_dir, out_dir)
 
-    if preproc_path.exists() and mask_path.exists():
+    if preproc_path.exists() and mask_path.exists() and xfm_path.exists():
         log.info("%s — already processed, skipping", name)
         return {"file": name, "status": "skipped"}
 
@@ -162,15 +221,16 @@ def process_file(args: tuple[Path, Path, Path]) -> dict:
         else:
             log.info("%s — already 1 mm isotropic, skipping resample", name)
 
-        brain_data = brain.get_fdata() * mask.get_fdata()
-        brain_data = np.clip(brain_data, 0, None)
-        brain = nib.Nifti1Image(brain_data, brain.affine, brain.header)
+        brain, mask = apply_mask_and_clip(brain, mask)
 
-        log.info("%s — cropping to brain bounding box", name)
-        brain, mask = crop_to_brain(brain, mask)
+        log.info("%s — rigid registration to %s", name, TEMPLATE_SPACE)
+        brain, mask = rigid_register_to_template(brain, mask, template_brain_path, xfm_path)
+
+        log.info("%s — applying transformed mask and clipping overshoot", name)
+        brain, mask = apply_mask_and_clip(brain, mask)
 
         nib.save(brain, preproc_path)
-        nib.save(mask,  mask_path)
+        nib.save(mask, mask_path)
         log.info("%s — done → %s", name, preproc_path.name)
         return {"file": name, "status": "success"}
     except Exception as e:
@@ -191,9 +251,13 @@ def write_dataset_description(out_dir: Path) -> None:
                 "N4 bias field correction (ANTs)",
                 "Skull stripping (SynthStrip)",
                 "Resample to 1mm isotropic",
-                "Tight crop to brain bounding box",
+                f"Rigid registration to {TEMPLATE_SPACE} template brain",
+                "Apply brain mask and clip negative interpolation overshoot after resampling operations",
             ]
         },
+        "TemplateSpace": TEMPLATE_SPACE,
+        "TemplateBrain": DEFAULT_TEMPLATE_BRAIN.name,
+        "TemplateT1w": DEFAULT_TEMPLATE_T1W.name,
     }
     with open(out_dir / "dataset_description.json", "w") as f:
         json.dump(desc, f, indent=2)
@@ -211,10 +275,15 @@ def main() -> None:
     parser.add_argument("--log_dir",     default=default_logs, type=Path)
     parser.add_argument("--n_workers",   default=48,           type=int)
     parser.add_argument("--itk_threads", default=2,            type=int)
+    parser.add_argument("--template_brain", default=DEFAULT_TEMPLATE_BRAIN, type=Path)
     args = parser.parse_args()
 
     bids_dir = args.bids.resolve()
-    out_dir  = args.output.resolve()
+    out_dir = args.output.resolve()
+    template_brain = args.template_brain.resolve()
+
+    if not template_brain.exists():
+        raise FileNotFoundError(f"Template brain not found: {template_brain}")
 
     write_dataset_description(out_dir)
 
@@ -229,7 +298,7 @@ def main() -> None:
         return
 
     log.info("Found %d anat file(s). Workers: %d", len(files), args.n_workers)
-    tasks = [(f, bids_dir, out_dir) for f in files]
+    tasks = [(f, bids_dir, out_dir, template_brain) for f in files]
 
     if args.n_workers > 1:
         os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = str(args.itk_threads)
