@@ -193,7 +193,7 @@ def apply_mask_and_clip(img: nib.Nifti1Image, mask: nib.Nifti1Image) -> tuple[ni
 
 def process_file(args: tuple[Path, Path, Path, Path]) -> dict:
     input_path, bids_dir, out_dir, template_brain_path = args
-    name = input_path.name
+    name = str(input_path.relative_to(bids_dir))
     preproc_path, mask_path, xfm_path = output_paths(input_path, bids_dir, out_dir)
 
     if preproc_path.exists() and mask_path.exists() and xfm_path.exists():
