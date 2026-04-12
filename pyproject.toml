@@ -8,5 +8,8 @@ dependencies = [
     "nibabel",
     "antspyx",
     "numpy",
-    "docker>=7.1.0",
 ]
+
+[project.scripts]
+anat-preproc = "preprocess:main"
+extract-structurals = "extract_bids:main"

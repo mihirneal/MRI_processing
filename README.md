@@ -50,3 +50,28 @@ docker run --rm \
 ```
 
 If you need to override the baked-in template brain path for debugging, pass `--template_brain` to the container entrypoint.
+
+## Structural Extraction
+
+The repo also includes a zip-to-BIDS extractor for the studio datasets:
+
+- `aabc`: keep only main `T1w` and `T2w` plus shipped JSON sidecars
+- `hcpya`: keep only `T1w_MPR1` and `T2w_SPC1`, written without a session label
+
+By default it reads from `/teamspace/studios/this_studio/{aabc,hcpya}` and writes separate BIDS trees to:
+
+- `data/aabc_bids`
+- `data/hcpya_bids`
+
+Run both datasets:
+
+```bash
+python extract_bids.py
+```
+
+Run one dataset only:
+
+```bash
+python extract_bids.py --dataset aabc
+python extract_bids.py --dataset hcpya
+```
