@@ -9,4 +9,5 @@ dependencies = [
     "antspyx",
     "numpy",
     "docker>=7.1.0",
+    "templateflow",
 ]

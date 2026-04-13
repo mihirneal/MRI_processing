@@ -11,7 +11,7 @@ wheels/
 .venv
 
 # Data
-data/
+data/*
 
 #AI
 .codex

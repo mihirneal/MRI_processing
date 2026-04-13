@@ -13,6 +13,7 @@ from pathlib import Path
 import ants
 import nibabel as nib
 import numpy as np
+import templateflow.api as tflow
 
 log = logging.getLogger("preproc")
 
@@ -38,11 +39,18 @@ def _pool_init(log_file: Path, itk_threads: int) -> None:
 
 SUPPORTED_SUFFIXES = ("T1w", "T2w", "FLAIR")
 TEMPLATE_SPACE = "MNI152NLin2009cAsym"
-DEFAULT_TEMPLATE_DIR = Path("/opt/templateflow") / f"tpl-{TEMPLATE_SPACE}"
-DEFAULT_TEMPLATE_BRAIN = (
-    DEFAULT_TEMPLATE_DIR / f"tpl-{TEMPLATE_SPACE}_res-01_desc-brain_T1w.nii.gz"
-)
-DEFAULT_TEMPLATE_T1W = DEFAULT_TEMPLATE_DIR / f"tpl-{TEMPLATE_SPACE}_res-01_T1w.nii.gz"
+
+
+def get_template_paths() -> tuple[Path, Path]:
+    brain = tflow.get(
+        TEMPLATE_SPACE, resolution=1, desc="brain", suffix="T1w", extension=".nii.gz"
+    )
+    t1w = tflow.get(
+        TEMPLATE_SPACE, resolution=1, desc=None, suffix="T1w", extension=".nii.gz"
+    )
+    if brain is None or t1w is None:
+        raise FileNotFoundError(f"Could not fetch {TEMPLATE_SPACE} template from templateflow")
+    return Path(brain), Path(t1w)
 
 
 def is_supported_anat_file(path: Path, bids_dir: Path) -> bool:
@@ -238,7 +246,7 @@ def process_file(args: tuple[Path, Path, Path, Path]) -> dict:
         return {"file": name, "status": "failed", "error": str(e)}
 
 
-def write_dataset_description(out_dir: Path) -> None:
+def write_dataset_description(out_dir: Path, template_brain: Path, template_t1w: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     desc = {
         "Name": "anat-preproc",
@@ -256,8 +264,8 @@ def write_dataset_description(out_dir: Path) -> None:
             ]
         },
         "TemplateSpace": TEMPLATE_SPACE,
-        "TemplateBrain": DEFAULT_TEMPLATE_BRAIN.name,
-        "TemplateT1w": DEFAULT_TEMPLATE_T1W.name,
+        "TemplateBrain": template_brain.name,
+        "TemplateT1w": template_t1w.name,
     }
     with open(out_dir / "dataset_description.json", "w") as f:
         json.dump(desc, f, indent=2)
@@ -273,22 +281,22 @@ def main() -> None:
     parser.add_argument("--subject",     default=None,         type=str)
     parser.add_argument("--output",      default=default_out,  type=Path)
     parser.add_argument("--log_dir",     default=default_logs, type=Path)
-    parser.add_argument("--n_workers",   default=48,           type=int)
-    parser.add_argument("--itk_threads", default=2,            type=int)
-    parser.add_argument("--template_brain", default=DEFAULT_TEMPLATE_BRAIN, type=Path)
+    total_cpus = os.cpu_count() or 1
+    parser.add_argument("--itk_threads", default=2,                    type=int)
+    parser.add_argument("--n_workers",   default=total_cpus // 2,      type=int)
     args = parser.parse_args()
 
     bids_dir = args.bids.resolve()
     out_dir = args.output.resolve()
-    template_brain = args.template_brain.resolve()
-
-    if not template_brain.exists():
-        raise FileNotFoundError(f"Template brain not found: {template_brain}")
-
-    write_dataset_description(out_dir)
 
     log_dir = args.log_dir.resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    template_brain, template_t1w = get_template_paths()
+
+    write_dataset_description(out_dir, template_brain, template_t1w)
+
     log_file = log_dir / "preprocessing.log"
     setup_logging(log_file)
 
